@@ -25,6 +25,7 @@ public class ReadStream {
     public static let bufferSize = Int(1.mib())
 
     private var reader: Reader?
+    private weak var issued: Reader?
     private let buffSize: Int
     private let data: Data?
     private let url: URL?
@@ -59,6 +60,7 @@ public class ReadStream {
     /// Resets the read stream. This either reassigns
     /// the data buffer or url to a new InputStream internally.
     public func reset() throws {
+        issued?.close()
         if let url = self.url {
             guard let s = InputStream(url: url) else {
                 throw Error.failedToCreateStream
@@ -72,14 +74,22 @@ public class ReadStream {
 
     /// Get access to an `AsyncStream` of `ByteBuffer`'s from the input source.
     public var stream: AsyncStream<ByteBuffer> {
-        let reader = self.reader.take()
+        let reader = takeReader()
         return AsyncStream(unfolding: { reader?.next().map { ByteBuffer(bytes: $0) } })
     }
 
     /// Get access to an `AsyncStream` of `Data` objects from the input source.
     public var dataStream: AsyncStream<Data> {
-        let reader = self.reader.take()
+        let reader = takeReader()
         return AsyncStream(unfolding: { reader?.next().map { Data($0) } })
+    }
+
+    private func takeReader() -> Reader? {
+        guard let reader = self.reader.take() else {
+            return nil
+        }
+        issued = reader
+        return reader
     }
 }
 
@@ -93,7 +103,14 @@ private final class Reader: Sendable {
     }
 
     deinit {
-        input.withLock { $0?.close() }
+        close()
+    }
+
+    func close() {
+        input.withLock { input in
+            input?.close()
+            input = nil
+        }
     }
 
     func next() -> ArraySlice<UInt8>? {
