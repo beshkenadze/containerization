@@ -88,7 +88,7 @@ struct ReadStreamTests {
     }
 
     @Test(arguments: View.allCases)
-    func resetRereadsFromStartWithoutDisturbingEarlierStream(_ view: View) async throws {
+    func resetEndsEarlierStreamAndRereadsFromStart(_ view: View) async throws {
         let dir = FileManager.default.uniqueTemporaryDirectory(create: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let file = dir.appendingPathComponent("blob")
@@ -100,13 +100,21 @@ struct ReadStreamTests {
             #expect(await first() == Data("AAAA".utf8))
 
             try source.reset()
+            #expect(await Self.drain(first).isEmpty)
             #expect(Data(await Self.drain(Self.chunks(of: source, view)).joined()) == payload)
-            let rest = await Self.drain(first)
-            #expect(Self.text(rest) == ["BBBB", "CCCC"])
 
             try source.reset()
             #expect(Data(await Self.drain(Self.chunks(of: source, view)).joined()) == payload)
         }
+
+        let source = try ReadStream(url: file, bufferSize: 4)
+        let first = Self.chunks(of: source, view)
+        #expect(await first() == Data("AAAA".utf8))
+        #expect(await Self.drain(Self.chunks(of: source, view)).isEmpty)
+        try source.reset()
+        let openAfterReset = try withExtendedLifetime(first) { try Self.openDescriptors(for: file) }
+        #expect(openAfterReset == 0)
+        #expect(await Self.drain(first).isEmpty)
     }
 
     @Test(arguments: View.allCases)
