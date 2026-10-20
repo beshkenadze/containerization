@@ -14,6 +14,7 @@
 // limitations under the License.
 //===----------------------------------------------------------------------===//
 
+import ContainerizationIO
 import Crypto
 import Foundation
 import NIOCore
@@ -230,6 +231,27 @@ struct LocalOCILayoutClientTests {
         let blobPath = root.appendingPathComponent("blobs/sha256").appendingPathComponent(try digest.validatedDigestEncoding())
         #expect(FileManager.default.fileExists(atPath: blobPath.path))
         #expect(try Data(contentsOf: blobPath) == data)
+    }
+
+    @Test func pushReportsCancellationInsteadOfDigestMismatch() async throws {
+        let root = FileManager.default.uniqueTemporaryDirectory(create: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let client = try LocalOCILayoutClient(root: root)
+        let data = Data("push me".utf8)
+        let digest = SHA256.hash(data: data).digestString
+        let descriptor = Descriptor(mediaType: "application/octet-stream", digest: digest, size: Int64(data.count))
+
+        let push = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            try await client.push(
+                name: "test", ref: "latest", descriptor: descriptor,
+                streamGenerator: { ReadStream(data: data).stream }, progress: nil)
+        }
+        await #expect(throws: CancellationError.self) { try await push.value }
+
+        let blobPath = root.appendingPathComponent("blobs/sha256").appendingPathComponent(try digest.validatedDigestEncoding())
+        #expect(!FileManager.default.fileExists(atPath: blobPath.path))
     }
 
     @Test func pushRejectsContentWithMismatchedDigest() async throws {
