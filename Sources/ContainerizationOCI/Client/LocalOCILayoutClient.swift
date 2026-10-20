@@ -90,6 +90,7 @@ package final class LocalOCILayoutClient: ContentClient {
             }
             let actual = ParsedDigest(hasher.finalize())
             guard actual == expected else {
+                try Task.checkCancellation()
                 throw ContainerizationError(
                     .internalError,
                     message: "content digest mismatch")
