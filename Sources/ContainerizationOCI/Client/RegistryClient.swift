@@ -23,6 +23,7 @@ import Logging
 import NIO
 import NIOHTTP1
 import NIOSSL
+import Synchronization
 
 #if os(macOS)
 import Network
@@ -65,6 +66,7 @@ public final class RegistryClient: ContentClient {
     let authentication: Authentication?
     let retryOptions: RetryOptions?
     let bufferSize: Int
+    private let cachedToken: Mutex<TokenResponse?> = .init(nil)
 
     public convenience init(
         reference: String,
@@ -193,10 +195,19 @@ public final class RegistryClient: ContentClient {
 
         var currentToken: TokenResponse?
         var attemptedBasicAuth = false
+        var sentCachedToken: TokenResponse?
+        if let token = cachedToken.withLock({ $0 }), let value = token.getToken() {
+            request.headers.replaceOrAdd(name: "Authorization", value: value)
+            sentCachedToken = token
+        }
 
         var retryCount = 0
         var response: HTTPClientResponse?
         while true {
+            if let token = sentCachedToken, !token.isValid(scope: nil) {
+                request.headers.remove(name: "Authorization")
+                sentCachedToken = nil
+            }
             request.body = try bodyClosure()
             do {
                 let _response = try await client.execute(request, deadline: .distantFuture)
@@ -205,6 +216,15 @@ public final class RegistryClient: ContentClient {
                     throw Error.insecureCredentialExchange(message: "registry \(host()) issued an authentication challenge over an insecure connection")
                 }
                 if _response.status == .unauthorized || _response.status == .forbidden {
+                    let rejectedCachedToken = sentCachedToken
+                    sentCachedToken = nil
+                    if let rejected = rejectedCachedToken?.getToken() {
+                        cachedToken.withLock { cached in
+                            if cached?.getToken() == rejected {
+                                cached = nil
+                            }
+                        }
+                    }
                     let authHeader = _response.headers[TokenRequest.authenticateHeaderName]
                     let challenges = Self.parseWWWAuthenticateHeaders(headers: authHeader)
 
@@ -223,6 +243,10 @@ public final class RegistryClient: ContentClient {
                     } catch let error as RegistryClient.Error {
                         throw error
                     } catch {
+                        if rejectedCachedToken != nil {
+                            request.headers.remove(name: "Authorization")
+                            continue
+                        }
                         // The server did not tell us how to authenticate our requests,
                         // Or we do not support scheme the server is requesting for.
                         // Throw the 401/403 to the caller, and let them decide how to proceed.
@@ -238,6 +262,7 @@ public final class RegistryClient: ContentClient {
                             throw ContainerizationError(.internalError, message: "failed to fetch Bearer token")
                         }
                         currentToken = _currentToken
+                        cachedToken.withLock { $0 = _currentToken }
                         request.headers.replaceOrAdd(name: "Authorization", value: token)
                         retryCount += 1
                     } catch let err as RegistryClient.Error {
