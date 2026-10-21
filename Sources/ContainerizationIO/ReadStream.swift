@@ -17,19 +17,21 @@
 import ContainerizationOS
 import Foundation
 import NIO
+import Synchronization
 
 /// `ReadStream` is a utility type for streaming data from a `URL`
 /// or `Data` blob.
 public class ReadStream {
     public static let bufferSize = Int(1.mib())
 
-    private var _stream: InputStream
+    private var reader: Reader?
+    private weak var issued: Reader?
     private let buffSize: Int
     private let data: Data?
     private let url: URL?
 
     public init() {
-        _stream = InputStream(data: .init())
+        reader = Reader(InputStream(data: .init()), bufferSize: Self.bufferSize)
         buffSize = Self.bufferSize
         self.data = Data()
         self.url = nil
@@ -42,14 +44,14 @@ public class ReadStream {
         guard let stream = InputStream(url: url) else {
             throw Error.failedToCreateStream
         }
-        self._stream = stream
+        self.reader = Reader(stream, bufferSize: bufferSize)
         self.buffSize = bufferSize
         self.url = url
         self.data = nil
     }
 
     public init(data: Data, bufferSize: Int = bufferSize) {
-        self._stream = InputStream(data: data)
+        self.reader = Reader(InputStream(data: data), bufferSize: bufferSize)
         self.buffSize = bufferSize
         self.url = nil
         self.data = data
@@ -58,59 +60,75 @@ public class ReadStream {
     /// Resets the read stream. This either reassigns
     /// the data buffer or url to a new InputStream internally.
     public func reset() throws {
-        self._stream.close()
+        issued?.close()
         if let url = self.url {
             guard let s = InputStream(url: url) else {
                 throw Error.failedToCreateStream
             }
-            self._stream = s
+            self.reader = Reader(s, bufferSize: buffSize)
             return
         }
         let data = self.data ?? Data()
-        self._stream = InputStream(data: data)
+        self.reader = Reader(InputStream(data: data), bufferSize: buffSize)
     }
 
     /// Get access to an `AsyncStream` of `ByteBuffer`'s from the input source.
     public var stream: AsyncStream<ByteBuffer> {
-        AsyncStream { cont in
-            self._stream.open()
-            defer { self._stream.close() }
-
-            let readBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: buffSize)
-
-            while true {
-                let byteRead = self._stream.read(readBuffer, maxLength: buffSize)
-                if byteRead <= 0 {
-                    readBuffer.deallocate()
-                    cont.finish()
-                    break
-                } else {
-                    let data = Data(bytes: readBuffer, count: byteRead)
-                    let buffer = ByteBuffer(bytes: data)
-                    cont.yield(buffer)
-                }
-            }
-        }
+        let reader = takeReader()
+        return AsyncStream(unfolding: { reader?.next().map { ByteBuffer(bytes: $0) } })
     }
 
     /// Get access to an `AsyncStream` of `Data` objects from the input source.
     public var dataStream: AsyncStream<Data> {
-        AsyncStream { cont in
-            self._stream.open()
-            defer { self._stream.close() }
+        let reader = takeReader()
+        return AsyncStream(unfolding: { reader?.next().map { Data($0) } })
+    }
 
-            let readBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: self.buffSize)
-            while true {
-                let byteRead = self._stream.read(readBuffer, maxLength: self.buffSize)
-                if byteRead <= 0 {
-                    readBuffer.deallocate()
-                    cont.finish()
-                    break
-                } else {
-                    let data = Data(bytes: readBuffer, count: byteRead)
-                    cont.yield(data)
-                }
+    private func takeReader() -> Reader? {
+        guard let reader = self.reader.take() else {
+            return nil
+        }
+        issued = reader
+        return reader
+    }
+}
+
+private final class Reader: Sendable {
+    private let input: Mutex<InputStream?>
+    private let bufferSize: Int
+
+    init(_ input: sending InputStream, bufferSize: Int) {
+        self.input = Mutex(input)
+        self.bufferSize = bufferSize
+    }
+
+    deinit {
+        close()
+    }
+
+    func close() {
+        input.withLock { input in
+            input?.close()
+            input = nil
+        }
+    }
+
+    func next() -> ArraySlice<UInt8>? {
+        input.withLock { input in
+            guard let stream = input else {
+                return nil
             }
+            if stream.streamStatus == .notOpen {
+                stream.open()
+            }
+            var chunk = [UInt8](repeating: 0, count: bufferSize)
+            let count = stream.read(&chunk, maxLength: bufferSize)
+            guard count > 0 else {
+                stream.close()
+                input = nil
+                return nil
+            }
+            return chunk[..<count]
         }
     }
 }
