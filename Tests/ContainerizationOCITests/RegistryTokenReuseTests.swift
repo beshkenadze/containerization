@@ -136,14 +136,25 @@ struct RegistryTokenReuseTests {
         return (server, client)
     }
 
-    private static func pushBlob(_ client: RegistryClient, _ data: Data) async throws {
+    private final class BodyReads: Sendable {
+        private let value = Mutex(0)
+
+        var count: Int { value.withLock { $0 } }
+
+        func add() {
+            value.withLock { $0 += 1 }
+        }
+    }
+
+    private static func pushBlob(_ client: RegistryClient, _ data: Data, reads: BodyReads? = nil) async throws {
         let descriptor = Descriptor(mediaType: MediaTypes.imageLayerGzip, digest: SHA256.hash(data: data).digestString, size: Int64(data.count))
         try await client.push(
             name: repoName,
             ref: "latest",
             descriptor: descriptor,
             streamGenerator: {
-                AsyncStream<ByteBuffer> { continuation in
+                reads?.add()
+                return AsyncStream<ByteBuffer> { continuation in
                     continuation.yield(ByteBuffer(bytes: data))
                     continuation.finish()
                 }
@@ -158,11 +169,13 @@ struct RegistryTokenReuseTests {
         let (server, client) = try await Self.start(registry)
         defer { Task { try? await server.shutdown() } }
 
-        try await Self.pushBlob(client, Data("layer".utf8))
+        let reads = BodyReads()
+        try await Self.pushBlob(client, Data("layer".utf8), reads: reads)
 
         #expect(registry.requests.map(\.method) == [.HEAD, .HEAD, .POST, .PUT])
         #expect(registry.authorizations == [nil, "Bearer token-1", "Bearer token-1", "Bearer token-1"])
         #expect(registry.tokenRequests == 1)
+        #expect(reads.count == 1)
     }
 
     @Test("concurrent blob pushes on one client send every blob once with a token")
@@ -171,15 +184,17 @@ struct RegistryTokenReuseTests {
         let (server, client) = try await Self.start(registry)
         defer { Task { try? await server.shutdown() } }
 
+        let reads = BodyReads()
         try await withThrowingTaskGroup(of: Void.self) { group in
             for index in 0..<8 {
-                group.addTask { try await Self.pushBlob(client, Data("layer-\(index)".utf8)) }
+                group.addTask { try await Self.pushBlob(client, Data("layer-\(index)".utf8), reads: reads) }
             }
             try await group.waitForAll()
         }
 
         let puts = registry.requests.filter { $0.method == .PUT }
         #expect(puts.count == 8)
+        #expect(reads.count == 8)
         #expect(puts.allSatisfy { $0.headers.first(name: "Authorization") != nil })
         #expect(registry.tokenRequests <= 8)
     }
