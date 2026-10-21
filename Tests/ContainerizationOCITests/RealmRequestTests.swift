@@ -18,13 +18,11 @@
 
 import ContainerizationError
 import ContainerizationExtras
-import Crypto
 import Foundation
 import NIO
 import NIOSSL
 import Network
 import Testing
-import X509
 
 @testable import ContainerizationOCI
 
@@ -104,11 +102,7 @@ private final class RecordingTLSServer: @unchecked Sendable {
     }
 
     static func start(respond: @escaping @Sendable (_ requestHead: String) -> String) throws -> RecordingTLSServer {
-        let identity = try Self.makeEphemeralIdentity()
-        var tls = TLSConfiguration.makeServerConfiguration(
-            certificateChain: [.certificate(identity.certificate)], privateKey: .privateKey(identity.privateKey))
-        tls.applicationProtocols = ["http/1.1"]
-        let sslContext = try NIOSSLContext(configuration: tls)
+        let sslContext = try NIOSSLContext(configuration: MockRegistryServer.makeServerTLSConfiguration())
 
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let seenBox = SeenBox()
@@ -155,29 +149,6 @@ private final class RecordingTLSServer: @unchecked Sendable {
                 channel.close(promise: nil)
             }
         }
-    }
-
-    private static func makeEphemeralIdentity() throws -> (certificate: NIOSSLCertificate, privateKey: NIOSSLPrivateKey) {
-        let certificateKey = Certificate.PrivateKey(P256.Signing.PrivateKey())
-        let subject = try DistinguishedName { CommonName("localhost") }
-        let now = Date()
-
-        let certificate = try Certificate(
-            version: .v3,
-            serialNumber: Certificate.SerialNumber(),
-            publicKey: certificateKey.publicKey,
-            notValidBefore: now.addingTimeInterval(-60),
-            notValidAfter: now.addingTimeInterval(60 * 60),
-            issuer: subject,
-            subject: subject,
-            extensions: Certificate.Extensions(),
-            issuerPrivateKey: certificateKey
-        )
-
-        return (
-            try NIOSSLCertificate(bytes: certificate.serializeAsPEM().derBytes, format: .der),
-            try NIOSSLPrivateKey(bytes: certificateKey.serializeAsPEM().derBytes, format: .der)
-        )
     }
 }
 
