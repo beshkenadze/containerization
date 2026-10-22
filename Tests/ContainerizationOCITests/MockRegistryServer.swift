@@ -14,10 +14,13 @@
 // limitations under the License.
 //===----------------------------------------------------------------------===//
 
+import Crypto
 import Foundation
 import NIOCore
 import NIOHTTP1
 import NIOPosix
+import NIOSSL
+import X509
 
 // MARK: - MockRegistryRequest / MockRegistryResponse
 
@@ -55,13 +58,18 @@ final class MockRegistryServer: Sendable {
 
     init(
         eventLoopGroup: any EventLoopGroup,
+        tls: Bool = false,
         handler: @escaping @Sendable (MockRegistryRequest) -> MockRegistryResponse
     ) async throws {
+        let sslContext = tls ? try NIOSSLContext(configuration: Self.makeServerTLSConfiguration()) : nil
         let bootstrap = ServerBootstrap(group: eventLoopGroup)
             .serverChannelOption(.backlog, value: 256)
             .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
             .childChannelInitializer { channel in
                 channel.eventLoop.makeCompletedFuture {
+                    if let sslContext {
+                        try channel.pipeline.syncOperations.addHandler(NIOSSLServerHandler(context: sslContext))
+                    }
                     try channel.pipeline.syncOperations.configureHTTPServerPipeline(
                         withPipeliningAssistance: false
                     )
@@ -88,6 +96,31 @@ final class MockRegistryServer: Sendable {
     /// Stop accepting connections and close the listening socket.
     func shutdown() async throws {
         try await channel.close().get()
+    }
+
+    static func makeServerTLSConfiguration() throws -> TLSConfiguration {
+        let certificateKey = Certificate.PrivateKey(P256.Signing.PrivateKey())
+        let subject = try DistinguishedName { CommonName("localhost") }
+        let now = Date()
+
+        let certificate = try Certificate(
+            version: .v3,
+            serialNumber: Certificate.SerialNumber(),
+            publicKey: certificateKey.publicKey,
+            notValidBefore: now.addingTimeInterval(-60),
+            notValidAfter: now.addingTimeInterval(60 * 60),
+            issuer: subject,
+            subject: subject,
+            extensions: Certificate.Extensions(),
+            issuerPrivateKey: certificateKey
+        )
+
+        var configuration = TLSConfiguration.makeServerConfiguration(
+            certificateChain: [.certificate(try NIOSSLCertificate(bytes: certificate.serializeAsPEM().derBytes, format: .der))],
+            privateKey: .privateKey(try NIOSSLPrivateKey(bytes: certificateKey.serializeAsPEM().derBytes, format: .der))
+        )
+        configuration.applicationProtocols = ["http/1.1"]
+        return configuration
     }
 }
 
